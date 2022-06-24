@@ -70,5 +70,11 @@
     <None Include="standardVertex.shader">
       <Filter>Source Files\Shader</Filter>
     </None>
+    <None Include="postProcessingFragment.shader">
+      <Filter>Source Files\Shader</Filter>
+    </None>
+    <None Include="postProcessingVertex.shader">
+      <Filter>Source Files\Shader</Filter>
+    </None>
   </ItemGroup>
 </Project>

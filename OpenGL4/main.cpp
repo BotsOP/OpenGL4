@@ -20,7 +20,7 @@
 void renderModel(glm::mat4 view, glm::mat4 projection, glm::vec3 position, Model model, Shader shader);
 void renderTerrain(glm::mat4 view, glm::mat4 projection);
 void renderSkyBox(glm::mat4 view, glm::mat4 projection);
-void renderWater(glm::mat4 view, glm::mat4 projection);
+void renderWater(glm::mat4 view, glm::mat4 projection, float t, int depth_renderbuffer);
 void handleInput(GLFWwindow* window, float deltaTime);
 void setupSkyBox();
 
@@ -28,9 +28,9 @@ glm::vec3 cameraPosition(0, 100, 0), cameraForward(0, 0, 1), cameraUp(0, 1, 0), 
 float movementSpeed = 1.0f;
 
 unsigned int plane, planeSize, VAO, cubeSize, water;
-unsigned int terrainShaderID, skyboxShaderID, waterShaderID, standardShaderID;
+unsigned int terrainShaderID, skyboxShaderID, waterShaderID, standardShaderID, postProcessingShaderID;
 unsigned int heightmapID, heightNormalID, heightmapID2, waterHeightmap;
-unsigned int dirtID, sandID, grassID;
+unsigned int dirtID, sandID, grassID, bayerID, ditherRampID;
 
 int main()
 {
@@ -64,7 +64,7 @@ int main()
     //Models
     Model tree("Assets/lowpolytree.obj");
 
-    //Terrain textures
+    //Textures
     heightmapID2 = loadTexture("Assets/Textures/displacement.png", GL_RGBA, 4);
     waterHeightmap = loadTexture("Assets/Textures/waterDisplacement.png", GL_RGBA, 4);
 
@@ -72,6 +72,9 @@ int main()
     dirtID = loadTexture("Assets/Textures/dirt.jpg", GL_RGB);
     sandID = loadTexture("Assets/Textures/sand.jpg", GL_RGB);
     grassID = loadTexture("Assets/Textures/grass.png", GL_RGBA, 4);
+
+    bayerID = loadTexture("Assets/Textures/BayerMatrix.png", GL_RGB);
+    ditherRampID = loadTexture("Assets/Textures/ditherRamp.png", GL_RGB);
 
 
     ///SETUP SHADER PROGRAM///
@@ -90,6 +93,9 @@ int main()
     Shader standardShader("standardVertex.shader", "standardFragment.shader");
     standardShaderID = standardShader.ID;
 
+    Shader postProcessingShader("postProcessingVertex.shader", "postProcessingFragment.shader");
+    postProcessingShaderID = postProcessingShader.ID;
+
     terrainShader.use();
     glUniform1i(glGetUniformLocation(terrainShader.ID, "heightMap"), 0);
     glUniform1i(glGetUniformLocation(terrainShader.ID, "normalMap"), 1);
@@ -97,7 +103,37 @@ int main()
     glUniform1i(glGetUniformLocation(terrainShader.ID, "sand"), 3);
     glUniform1i(glGetUniformLocation(terrainShader.ID, "grass"), 4);
 
+    postProcessingShader.use();
+    glUniform1i(glGetUniformLocation(postProcessingShader.ID, "screenTexture"), 0);
+    glUniform1i(glGetUniformLocation(postProcessingShader.ID, "noiseTexture"), 1);
+    glUniform1i(glGetUniformLocation(postProcessingShader.ID, "ditherRampTexture"), 2);
+
+
     stbi_set_flip_vertically_on_load(true);
+
+    // GENERATE QUAD
+    float quadVertices[] = { // vertex attributes for a quad that fills the entire screen in Normalized Device Coordinates.
+        // positions   // texCoords
+        -1.0f,  1.0f,  0.0f, 1.0f,
+        -1.0f, -1.0f,  0.0f, 0.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+
+        -1.0f,  1.0f,  0.0f, 1.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+         1.0f,  1.0f,  1.0f, 1.0f
+    };
+
+    unsigned int quadVAO, quadVBO;
+    glGenVertexArrays(1, &quadVAO);
+    glGenBuffers(1, &quadVBO);
+    glBindVertexArray(quadVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), &quadVertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
 
     // GENERATE FRAMEBUFFER
 
@@ -116,6 +152,32 @@ int main()
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         cout << "ERROR::FRAMEBUFFER:: Framebuffer is not complete!" << endl;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+
+
+    unsigned int postProcessingBuffer;
+    glGenFramebuffers(1, &postProcessingBuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, postProcessingBuffer);
+    // create a color attachment texture
+    unsigned int textureColorbuffer;
+    glGenTextures(1, &textureColorbuffer);
+    glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureColorbuffer, 0);
+    // create a renderbuffer object for depth and stencil attachment (we won't be sampling these)
+    unsigned int rbo;
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height); // use a single renderbuffer object for both a depth AND stencil buffer.
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo); // now actually attach it
+    // now that we actually created the framebuffer and added all attachments we want to check if it is actually complete now
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        cout << "ERROR::FRAMEBUFFER:: Framebuffer is not complete!" << endl;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    std::cout << glGetError() << endl;
     
     // OPENGL SETTINGS //
 
@@ -129,8 +191,6 @@ int main()
         float deltaTime = t - previousT;
         previousT = t;
 
-        
-
         handleInput(window, deltaTime);
 
         glm::mat4 view = glm::lookAt(cameraPosition, cameraPosition + cameraForward, cameraUp);
@@ -141,6 +201,7 @@ int main()
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
 
         renderTerrain(view, projection);
 
@@ -148,23 +209,34 @@ int main()
 
         // SECOND RENDER
 
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, postProcessingBuffer);
         glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
 
         renderSkyBox(view, projection);
         renderTerrain(view, projection);
         renderModel(view, projection, glm::vec3(0, 50, 0), tree, standardShader);
 
 
-        waterShader.use();
-        glUniform1f(glGetUniformLocation(waterShaderID, "t"), t);
-        glUniform1i(glGetUniformLocation(waterShaderID, "heightMap"), waterHeightmap);
+        renderWater(view, projection, t, depth_renderbuffer);
+        
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0); // back to default
+        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        postProcessingShader.use();
+        glBindVertexArray(quadVAO);
+        glDisable(GL_DEPTH_TEST);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, depth_renderbuffer);
+        glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, waterHeightmap);
-        renderWater(view, projection);
+        glBindTexture(GL_TEXTURE_2D, bayerID);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, ditherRampID);
+
+        glDrawArrays(GL_TRIANGLES, 0, 6);
 
         glfwSwapBuffers(window);
         glfwPollEvents();     
@@ -250,7 +322,7 @@ void renderTerrain(glm::mat4 view, glm::mat4 projection)
     glDrawElements(GL_TRIANGLES, planeSize, GL_UNSIGNED_INT, 0);
 }
 
-void renderWater(glm::mat4 view, glm::mat4 projection)
+void renderWater(glm::mat4 view, glm::mat4 projection, float t, int depth_renderbuffer)
 {
     glUseProgram(waterShaderID);
     glDisable(GL_CULL_FACE);
@@ -265,6 +337,13 @@ void renderWater(glm::mat4 view, glm::mat4 projection)
     glUniformMatrix4fv(glGetUniformLocation(waterShaderID, "view"), 1, GL_FALSE, glm::value_ptr(view));
     glUniformMatrix4fv(glGetUniformLocation(waterShaderID, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
     glUniform3fv(glGetUniformLocation(waterShaderID, "cameraPosition"), 1, glm::value_ptr(cameraPosition));
+
+    glUniform1f(glGetUniformLocation(waterShaderID, "t"), t);
+    glUniform1i(glGetUniformLocation(waterShaderID, "heightMap"), waterHeightmap);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, depth_renderbuffer);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, waterHeightmap);
 
     glBindVertexArray(water);
     glDrawElements(GL_TRIANGLES, planeSize, GL_UNSIGNED_INT, 0);
